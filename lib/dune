@@ -3,11 +3,12 @@
   (public_name ezxenstore)
   (wrapped false)
   (libraries
+    astring
     cmdliner
     logs
     threads
     uuidm
     xenctrl
-    xenstore_transport.unix
+    xenstore_transport
     xenstore.unix)
 )

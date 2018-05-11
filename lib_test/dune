@@ -1,10 +1,12 @@
-(executable
-  (name main)
-  (libraries ezxenstore)
+(executables
+  (names main cache_test)
+  (libraries
+    ezxenstore
+    alcotest)
 )
 
 (alias
   (name runtest)
-  (deps main.exe)
+  (deps cache_test.exe)
   (action (run %{deps}))
 )
