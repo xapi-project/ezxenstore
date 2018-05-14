@@ -24,9 +24,6 @@ module Make (Debug: DEBUG) = struct
   open Xenstore
   exception Watch_overflow
 
-  let _introduceDomain = "@introduceDomain"
-  let _releaseDomain = "@releaseDomain"
-
   module IntMap = Map.Make(struct type t = int let compare = compare end)
   module IntSet = Set.Make(struct type t = int let compare = compare end)
 
@@ -40,10 +37,12 @@ module Make (Debug: DEBUG) = struct
     val domain_disappeared : Xenctrl.handle -> Xenstore.Xs.xsh -> int -> unit
   end
 
-  let watch ~xs token path =
+  let watch ~xs token cb path =
     debug "xenstore watch path=%s token=%s" path token;
     try
-      xs.Xs.watch path token
+      if !Xenstore.caching_enabled
+      then xs.Xs.better_watch (Astring.String.cuts ~sep:"/" path |> Xenstore.strip_leading_slash) token cb
+      else xs.Xs.watch path token
     with Xs_protocol.Eexist ->
       debug "xenstore watch on %s threw Xs_protocol.Eexist" path
 
@@ -51,7 +50,9 @@ module Make (Debug: DEBUG) = struct
   let unwatch ~xs token path =
     try
       debug "xenstore unwatch path=%s token=%s" path token;
-      xs.Xs.unwatch path token
+      if !Xenstore.caching_enabled
+      then xs.Xs.better_unwatch (Astring.String.cuts ~sep:"/" path |> Xenstore.strip_leading_slash) token
+      else xs.Xs.unwatch path token
     with Xs_protocol.Enoent _ ->
       debug "xenstore unwatch %s threw Xs_protocol.Enoent" path
 
@@ -87,11 +88,15 @@ module Make (Debug: DEBUG) = struct
              let watches = ref IntSet.empty in
              let uuids = ref IntMap.empty in
 
+             let watch_cb path _tok =
+                Actions.watch_fired xc xs (Printf.sprintf "/%s" (String.concat "/" path)) !domains !watches
+             in
+
              let add_watches_for_domain xs domid uuid =
                debug "Adding watches for: domid %d" domid;
                Actions.domain_appeared xc xs domid;
                let token = Actions.watch_token domid in
-               List.iter (watch ~xs token) (Actions.interesting_paths_for_domain domid uuid);
+               List.iter (watch ~xs token watch_cb) (Actions.interesting_paths_for_domain domid uuid);
                uuids := IntMap.add domid uuid !uuids;
                watches := IntSet.add domid !watches in
 
@@ -147,9 +152,13 @@ module Make (Debug: DEBUG) = struct
                      Actions.watch_fired xc xs path !domains !watches) in
 
              let register_for_watches () =
-               let c = get_client () in
-               Client.immediate c
-                 (fun xs ->
+               if !Xenstore.caching_enabled
+               then begin
+                 Xenstore.special_cb := (fun (_,_) -> look_for_different_domains ())
+               end else
+                let c = get_client () in
+                Client.immediate c
+                  (fun xs ->
                     Client.set_watch_callback c (process_one_watch c);
                     Client.watch xs _introduceDomain "";
                     Client.watch xs _releaseDomain "") in

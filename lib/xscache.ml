@@ -46,8 +46,11 @@ module Cache(Q : WATCHQUEUE) = struct
     {tree; watches=List.remove_assoc path t.watches}       
 
   let write (t : t) path value =
+    Printf.printf "write path=[%s] value=%s\n%!" (String.concat "/" path) value;
     let rec inner watches tree path' =
-      Printf.printf "inner: watches = [%s]\n"
+      Printf.printf "inner: tree.name=%s path'=[%s] watches = [%s]\n"
+        tree.name
+        (String.concat "/" path')
         (String.concat ";" 
             (List.map 
                 (fun (x,(y,_)) ->
@@ -72,7 +75,7 @@ module Cache(Q : WATCHQUEUE) = struct
               (fun c ->
                  if c.name <> x
                  then c
-                 else inner watches c xs)
+                 else inner further c xs)
               tree.children in
           {tree with children}
         end else begin
