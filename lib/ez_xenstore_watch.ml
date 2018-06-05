@@ -30,7 +30,7 @@ module Make (Debug: DEBUG) = struct
   module type WATCH_ACTIONS = sig
     val watch_token : int -> string
     val interesting_paths_for_domain : int -> string -> string list
-    val watch_fired : Xenctrl.handle -> Xenstore.Xs.xsh -> string -> Xenctrl.domaininfo IntMap.t -> IntSet.t -> unit
+    val watch_fired : Xenctrl.handle -> Xenstore.Xs.xsh -> string -> Xenctrl.domaininfo IntMap.t -> IntSet.t -> (string list -> string -> unit) -> unit 
     val unmanaged_domain : int -> string -> bool
     val found_running_domain : int -> string -> unit
     val domain_appeared : Xenctrl.handle -> Xenstore.Xs.xsh -> int -> unit
@@ -41,17 +41,20 @@ module Make (Debug: DEBUG) = struct
     debug "xenstore watch path=%s token=%s" path token;
     try
       if !Xenstore.caching_enabled
-      then xs.Xs.better_watch (Astring.String.cuts ~sep:"/" path |> Xenstore.strip_leading_slash) token cb
+      then xs.Xs.better_watch [(Astring.String.cuts ~sep:"/" path |> Xenstore.strip_leading_slash),token,cb]
       else xs.Xs.watch path token
-    with Xs_protocol.Eexist ->
+    with
+    | Xs_protocol.Eexist ->
       debug "xenstore watch on %s threw Xs_protocol.Eexist" path
-
+    | e -> 
+      debug "Got an exception while watching: %s" (Printexc.to_string e);
+      raise e
 
   let unwatch ~xs token path =
     try
       debug "xenstore unwatch path=%s token=%s" path token;
       if !Xenstore.caching_enabled
-      then xs.Xs.better_unwatch (Astring.String.cuts ~sep:"/" path |> Xenstore.strip_leading_slash) token
+      then xs.Xs.better_unwatch [(Astring.String.cuts ~sep:"/" path |> Xenstore.strip_leading_slash),token]
       else xs.Xs.unwatch path token
     with Xs_protocol.Enoent _ ->
       debug "xenstore unwatch %s threw Xs_protocol.Enoent" path
@@ -88,8 +91,8 @@ module Make (Debug: DEBUG) = struct
              let watches = ref IntSet.empty in
              let uuids = ref IntMap.empty in
 
-             let watch_cb path _tok =
-                Actions.watch_fired xc xs (Printf.sprintf "/%s" (String.concat "/" path)) !domains !watches
+             let rec watch_cb path _tok =
+                Actions.watch_fired xc xs (Printf.sprintf "/%s" (String.concat "/" path)) !domains !watches watch_cb
              in
 
              let add_watches_for_domain xs domid uuid =
@@ -149,7 +152,7 @@ module Make (Debug: DEBUG) = struct
                else 
                  Client.immediate c (fun h -> 
                      let xs = Xs.ops h in
-                     Actions.watch_fired xc xs path !domains !watches) in
+                     Actions.watch_fired xc xs path !domains !watches watch_cb) in
 
              let register_for_watches () =
                if !Xenstore.caching_enabled

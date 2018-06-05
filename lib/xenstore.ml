@@ -40,50 +40,57 @@ let make_client () =
     raise e
 
 
-let m = Mutex.create ()
+let lock = Mutex.create ()
 
-let with_lock n f x =
+let with_lock m n f x =
   let id = Thread.id (Thread.self ()) in
-  Printf.printf "%d Acquiring lock (%s)\n%!" id n;
+  (* Printf.printf "%d Acquiring lock (%s)\n%!" id n; *)
   Mutex.lock m;
   try
-    Printf.printf "%d Got lock (%s)\n%!" id n;
+    (* Printf.printf "%d Got lock (%s)\n%!" id n; *)
     let result = f x in
-    Printf.printf "%d Releasing lock (%s)\n%!" id n;
+    (* Printf.printf "%d Releasing lock (%s)\n%!" id n; *)
     Mutex.unlock m;
     result
   with e ->
-    Printf.printf "%d Releasing lock (%s) (in exception handler)\n%!" id n;
+    (* Printf.printf "%d Releasing lock (%s) (in exception handler: e=%s)\n%!" id n (Printexc.to_string e); *)
     Mutex.unlock m;
     raise e
 
-let watches = ref []
+let watches = Queue.create ()
 let wcond = Condition.create ()
 
 module WatchQueue = struct  
   let enqueue_watch cb =
     (* Nb, this will be called with the mutex already locked *)
-    Printf.printf "enqueuing fired watch callback\n%!";
-    watches := cb :: !watches;
+    (* Printf.printf "enqueuing fired watch callback\n%!"; *)
+    Queue.add cb watches;
     Condition.broadcast wcond
   
   let start_dequeue_watches_thread () =
     Thread.create (fun () ->
       let rec inner () =
-        let cbs = with_lock "dequeue" (fun () ->
-          Printf.printf "dequeue: List.length !watches=%d\n%!" (List.length !watches); 
-          while (List.length !watches) = 0 do
-            Printf.printf "%d Releasing lock on condition (%s)\n%!" (Thread.id (Thread.self ())) "dequeue";
-            Condition.wait wcond m;
-            Printf.printf "%d Got lock again after condition (%s)\n%!" (Thread.id (Thread.self ())) "dequeue";
+        let q = with_lock lock "dequeue" (fun () ->
+          (* Printf.printf "dequeue: List.length !watches=%d\n%!" (Queue.length watches);  *)
+          while (Queue.length watches) = 0 do
+            (* Printf.printf "%d Releasing lock on condition (%s)\n%!" (Thread.id (Thread.self ())) "dequeue"; *)
+            Condition.wait wcond lock;
+            (* Printf.printf "%d Got lock again after condition (%s)\n%!" (Thread.id (Thread.self ())) "dequeue"; *)
           done;
-          let cbs = !watches in
-          watches := [];
-          cbs
+          let result = Queue.copy watches in
+          Queue.clear watches;
+          result
           ) ()
         in
-        Printf.printf "Calling callback...\n%!";
-        List.iter (fun cb -> try cb () with _ -> ()) cbs;
+        (* Printf.printf "Queue length: %d\n%!" (Queue.length q); *)
+        Queue.iter (fun i ->
+          (* Printf.printf "Calling callback...\n%!"; *)
+          (* let now = Unix.gettimeofday () in *)
+          (try i () with _ -> ());
+          (* let thn = Unix.gettimeofday () in *)
+          (* Printf.printf "Callback took %f seconds\n%!" (thn -. now) *)
+          )
+          q;
         inner ()
       in inner ()) ()
 
@@ -107,10 +114,30 @@ let rec ls_lR xs dir =
     let subdirs = try Client.directory xs dir |> List.filter (fun x -> x <> "") |> List.map (fun x -> Filename.concat dir x) with _ -> [] in
     this @ (List.concat (List.map (ls_lR xs) subdirs))
 
+(* Cache synchronisation *)
+let cache_conditions = Hashtbl.create 10
+let cache_sync_stem = "cachesync:"
+let cache_sync_seen = ref (0L)
+let cache_sync_stem_len = String.length cache_sync_stem
+
 let process_watch c (path, token) =
-  if path = _introduceDomain || path = _releaseDomain then !special_cb (path, token) else begin
-  Printf.printf "process_watch: %s %s\n%!" path token;
-  with_lock "process watch" (fun () ->
+  (* Printf.printf "process_watch: %s %s\n%!" path token; *)
+  if String.length token > cache_sync_stem_len && String.sub token 0 cache_sync_stem_len = cache_sync_stem then begin
+    let n = String.sub token cache_sync_stem_len (String.length token - cache_sync_stem_len) |> Int64.of_string in
+    (* Printf.printf "%d process_watch: got cache trigger %s\n%!" (Thread.id (Thread.self ())) token; *)
+    with_lock lock "cache trigger" (fun () ->
+      cache_sync_seen := n; 
+      try
+        let condition = Hashtbl.find cache_conditions token in
+        (* Printf.printf "%d broadcasting %s\n%!" (Thread.id (Thread.self ())) token; *)
+        Condition.broadcast condition
+      with e ->
+        (* Printf.printf "%d got exception! %s\n%!" (Thread.id (Thread.self ())) (Printexc.to_string e); *)
+        ()
+      ) ()
+  end else begin
+  if path = _introduceDomain || path = _releaseDomain then (WatchQueue.enqueue_watch (fun () -> !special_cb (path, token))) else begin
+  with_lock lock "process watch" (fun () ->
     let t = !cache in
     let vopt =
       try
@@ -121,44 +148,44 @@ let process_watch c (path, token) =
     let path' = list_path path in
     begin
       match vopt with
-      | Some v -> 
+      | Some v ->
+        (* Printf.printf "cache update: %s=%s\n%!" path v; *)
         cache := Cache.write t path' v
       | None ->
+        (* Printf.printf "cache update: rm %s\n%!" path; *)
         cache := Cache.rm t path'
     end) ()
   end
-
-let enable_cache () =
-  with_lock "enable cache" (fun () ->
-    let c = make_client () in
-    client := Some c;
-    caching_enabled := true;
-    Client.set_watch_callback c (process_watch c);
-    Client.immediate c (fun xs ->
-      Client.watch xs "/" "tok";
-      Client.watch xs _introduceDomain "";
-      Client.watch xs _releaseDomain "";
-      Client.rm xs "/cache";
-      let lslr = ls_lR xs "/" in
-      let t = List.fold_left (fun t (p,v) ->
-        Cache.write t (list_path p) v) Cache.empty lslr in
-      cache := t;
-      let _th = WatchQueue.start_dequeue_watches_thread () in
-      ()
-    )) ()
+end
 
 let get_client () =
-  Printf.printf "Get client...\n%!";
-  with_lock "get client" (fun () ->
+  with_lock lock "get_client" (fun () ->
     match !client with
     | None ->
       let c = make_client () in
       client := Some c;
+      if !caching_enabled then begin
+        Client.set_watch_callback c (process_watch c);
+        Client.immediate c (fun xs ->
+          Client.watch xs "/" "tok";
+          Client.watch xs _introduceDomain "";
+          Client.watch xs _releaseDomain "";
+          Client.rm xs "/cache";
+          let lslr = ls_lR xs "/" in
+          Printf.printf "Populating internal cache\n%!";
+          let t = List.fold_left (fun t (p,v) ->
+            Cache.write t (list_path p) v) Cache.empty lslr in
+          Printf.printf "Populated\n%!";
+          cache := t;
+          let _th = WatchQueue.start_dequeue_watches_thread () in
+          ())
+      end;
       c
     | Some c ->
-      c) ()
+      c
+   ) ()
 
-let forget_client () = client := None
+let forget_client () = with_lock lock "forget client" (fun () -> client := None) ()
 
 
 let counter = ref 0l
@@ -167,6 +194,8 @@ module StringSet = Set.Make(struct type t = string let compare = String.compare 
 
 module PathRecorder = struct
   type t = {
+    token: string;
+    m: Mutex.t;
     mutable accessed_paths: StringSet.t;        (* paths read or written to *)
     mutable watched_paths: StringSet.t;         (* paths being watched *)
   }
@@ -179,7 +208,7 @@ module PathRecorder = struct
   let accessed t_opt = match t_opt with | Some t -> t.accessed_paths | None -> StringSet.empty
   let watched t_opt = match t_opt with | Some t -> t.watched_paths | None -> StringSet.empty
 
-  let empty = { accessed_paths = StringSet.empty; watched_paths = StringSet.empty }
+  let empty token = { token; m=Mutex.create (); accessed_paths = StringSet.empty; watched_paths = StringSet.empty }
 end
 
 
@@ -201,8 +230,8 @@ module Xs = struct
     introduce : domid -> nativeint -> int -> unit;
     set_target : domid -> domid -> unit;
 
-    better_watch : string list -> string -> (string list -> string -> unit) -> unit;
-    better_unwatch : string list -> string -> unit;
+    better_watch : (string list * string * (string list -> string -> unit)) list -> unit;
+    better_unwatch : (string list * string) list -> unit;
 
     set_special_watch_cb : (string * string -> unit) -> unit;
 
@@ -211,19 +240,28 @@ module Xs = struct
   }
 
   let sync h =
-    let cb _path _tok = with_lock "sync callback" (fun () -> Condition.broadcast wcond) () in
-    let path = ["cache"] in 
-    let n = with_lock "sync find n" (fun () -> cache_n := Int64.add 1L !cache_n; cache := Cache.watch !cache path "cache" cb; !cache_n) () in
-    Client.write h (Printf.sprintf "/%s" (String.concat "/" path)) (Int64.to_string n);
-    let check () = match Cache.read !cache path with | Some x -> Printf.printf "cache wait: %s %Ld\n%!" x n; Int64.of_string x < n | None -> true in
-    with_lock "sync check cond" (fun () ->
+    let path = "/cache" in 
+    let cond = Condition.create () in
+    let n,token = with_lock lock "sync find n"
+      (fun () ->
+        cache_n := Int64.add 1L !cache_n;
+        let n = !cache_n in
+        let token = Printf.sprintf "%s%Ld" cache_sync_stem n in
+        Hashtbl.replace cache_conditions token cond;
+        Client.watch h path token; (* With the lock held so we guarantee to respect ordering of watches *)
+        n, token) () in
+    (* Printf.printf "%d sync: waiting for cache=%Ld\n%!" (Thread.id (Thread.self ())) n; *)
+    let check () = !cache_sync_seen < n in
+    with_lock lock "sync check cond" (fun () ->
       while check () do
-        Printf.printf "%d Releasing lock on condition (%s)\n%!" (Thread.id (Thread.self ())) "sync check cond";
-        Condition.wait wcond m;
-        Printf.printf "%d Got lock again after condition (%s)\n%!" (Thread.id (Thread.self ())) "sync check cond"
-      done
+        (* Printf.printf "%d Releasing lock on condition (%s)\n%!" (Thread.id (Thread.self ())) "sync check cond"; *)
+        Condition.wait cond lock;
+        (* Printf.printf "%d Got lock again after condition (%s)\n%!" (Thread.id (Thread.self ())) "sync check cond" *)
+      done;
+      Hashtbl.remove cache_conditions token
       ) ();
-    with_lock "sync remove callback" (fun () -> cache := Cache.unwatch !cache path "cache") ()
+    (* Printf.printf "%d sync: cache=%Ld\n%!" (Thread.id (Thread.self ())) n; *)
+    Client.unwatch h path token
     
 
   let gen_ops path_recorder immediate h =
@@ -234,49 +272,66 @@ module Xs = struct
     then {
       read =
         (fun p ->
-          let t = with_lock "read" (fun () -> !cache) () in
-          match Cache.read t (path p) with 
+          let t,p' = with_lock lock "read" (fun () -> !cache, path p) () in
+          match Cache.read t p' with 
           | Some x -> x
           | None -> raise (Xs_protocol.Enoent p));
       directory =
         (fun p ->
-          let t = with_lock "directory" (fun () -> !cache) () in
-          match Cache.directory t (path p) with
+          let t,p' = with_lock lock "directory" (fun () -> !cache, path p) () in
+          match Cache.directory t p' with
           | Some x -> x
           | None -> raise (Xs_protocol.Enoent p));
       write =
         (fun p v ->
-          ignore(path p);
+          let p' = with_lock lock "write" (fun () -> path p) () in
           Client.write h p v;
-          if immediate then sync h);
+          if immediate then begin
+            sync h;
+            with_lock lock "verify_cache" (fun () -> 
+              match Cache.read !cache p' with
+              | Some x -> if x <> v then failwith "Argh"
+              | None -> failwith (Printf.sprintf "Argh2 %s %s" p v)) ()
+          end
+          );
       writev =
         (fun base_path kvs ->
           List.iter (fun (k, v) ->
             let p = base_path ^ "/" ^ k in 
-            ignore(path p);
+            let _p' = with_lock lock "writev" (fun () -> path p) () in
             Client.write h p v) kvs;
             if immediate then sync h);
       mkdir = 
         (fun p ->
-          ignore(path p);
+          let _p' = with_lock lock "mkdir" (fun () -> path p) in
           Client.mkdir h p);
       rm =
         (fun p ->
-          ignore(path p);
+          let _p' = with_lock lock "rm" (fun () -> path p) in
           (try Client.rm h p with Xs_protocol.Enoent _ -> ());
           if immediate then sync h);
       setperms = Client.setperms h;
       getdomainpath = Client.getdomainpath h;
       watch = (fun _p _tok -> ignore(failwith "Unsupported: use better watches!"));
       unwatch = (fun _p _tok -> ignore(failwith "Unsupported: use better watches!"));
-      better_watch = (fun path tok cb -> 
-        with_lock "better watch" (fun () ->
-          PathRecorder.watch path_recorder (Printf.sprintf "/%s" (String.concat "/" path));
-          cache := Cache.watch !cache path tok cb) ());
-      better_unwatch = (fun path tok ->
-        with_lock "better unwatch" (fun () ->
-          PathRecorder.unwatch path_recorder (Printf.sprintf "/%s" (String.concat "/" path));
-          cache := Cache.unwatch !cache path tok) ());
+      better_watch = (fun watches -> 
+        with_lock lock "better watch" (fun () ->
+          let single (path,tok,cb) =
+            (* Printf.printf "watching [/%s] tok=%s\n%!" (String.concat "/" path) tok; *)
+            (match path_recorder with | Some pr -> if pr.PathRecorder.token != tok then failwith "Token invalid" | None -> ());
+            PathRecorder.watch path_recorder (Printf.sprintf "/%s" (String.concat "/" path));
+            cache := Cache.watch !cache path tok cb
+          in
+          List.iter single watches) ());
+      better_unwatch = (fun watches ->
+        with_lock lock "better unwatch" (fun () ->
+          let single (path,tok) =
+            (* Printf.printf "unwatching [/%s] tok=%s\n%!" (String.concat "/" path) tok; *)
+            (match path_recorder with | Some pr -> if pr.PathRecorder.token != tok then failwith "Token invalid" | None -> ());
+            PathRecorder.unwatch path_recorder (Printf.sprintf "/%s" (String.concat "/" path));
+            cache := Cache.unwatch !cache path tok
+          in
+          List.iter single watches) ());
       set_special_watch_cb = (fun cb ->
           special_cb := cb
         );
@@ -296,8 +351,8 @@ module Xs = struct
     unwatch = Client.unwatch h;
     introduce = Client.introduce h;
     set_target = Client.set_target h;
-    better_watch = (fun _ _ _ -> ignore(failwith "Unsupported in uncached xenstore"));
-    better_unwatch = (fun _ _ -> ignore(failwith "Unsupported in uncached xenstore"));
+    better_watch = (fun _ -> ignore(failwith "Unsupported in uncached xenstore"));
+    better_unwatch = (fun _ -> ignore(failwith "Unsupported in uncached xenstore"));
     set_special_watch_cb = (fun _ -> ignore (failwith "Unsupported in uncached xenstore"));
     mkdirperms = (fun path -> (Client.mkdir h path; Client.setperms h path));
     }
@@ -313,44 +368,50 @@ module Xs = struct
     if not !caching_enabled
     then wait_uncached f
     else begin
-      counter := Int32.succ !counter;
-      let token = Printf.sprintf "%s%ld" "auto_internal:" !counter in
-  
-      (* We signal the caller via this cancellable task: *)
-      let path_recorder = Some PathRecorder.empty in
-      let xs = gen_ops path_recorder true (Client.immediate (get_client ()) (fun c -> c)) in
+        (* We signal the caller via this cancellable task: *)
+      let path_recorder = with_lock lock "gen_pathrecorder" (fun () ->
+        counter := Int32.succ !counter;
+        PathRecorder.empty (Printf.sprintf "%s%ld" "auto_internal:" !counter)) () in
+      let xs = gen_ops (Some path_recorder) true (Client.immediate (get_client ()) (fun c -> c)) in
       let unwatch_all () =
-        let watched_paths = PathRecorder.watched path_recorder |> StringSet.elements in
-        List.iter (fun p -> xs.better_unwatch (list_path p) token) watched_paths
+        with_lock path_recorder.PathRecorder.m "unwatch_all" (fun () ->
+          let watched_paths = with_lock lock "unwatch_all" (fun () -> PathRecorder.watched (Some path_recorder) |> StringSet.elements) () in
+          xs.better_unwatch (List.map (fun p -> ((list_path p),path_recorder.PathRecorder.token)) watched_paths)) ()
       in
 
       let t = Xs_client_unix.Task.make () in
       Xs_client_unix.Task.on_cancel t (fun () -> unwatch_all ());
 
       (* Adjust the paths we're watching (if necessary) and block (if possible) *)
-      let rec watch_fn _path _tok =
+      let rec watch_fn path tok =
+        (* Printf.printf "%d evaluating watch_fn: path=/%s tok=%s\n%!" (Thread.id (Thread.self ())) (String.concat "/" path) tok; *)
         try
-          let result = f xs in
-          Xs_client_unix.Task.wakeup t result;
-          unwatch_all ();
+          with_lock path_recorder.PathRecorder.m "watch_fn outer" (fun () -> 
+            with_lock lock "watch_fn" (fun () -> PathRecorder.clear_access (Some path_recorder)) ();
+            let result = f xs in
+            Xs_client_unix.Task.wakeup t result) ();
+          unwatch_all ()
         with
           | Xs_protocol.Eagain ->
             adjust_paths ()
-          | _ ->
+          | e ->
+            Printf.printf "XXXXXXX caught exception %s, cancelling\n%!" (Printexc.to_string e);
+            unwatch_all ();
             Xs_client_unix.Task.cancel t
       and adjust_paths () =
-        let current_paths = PathRecorder.watched path_recorder in
-        Printf.printf "current_paths: [%s]  " (String.concat ";" (StringSet.elements current_paths));
-        (* Paths which weren't read don't need to be watched: *)
-        Printf.printf "accessed: [%s]  " (String.concat ";" (StringSet.elements (PathRecorder.accessed path_recorder)));
-        let old_paths = StringSet.diff current_paths (PathRecorder.accessed path_recorder) in
-        Printf.printf "old_paths: [%s]\n%!" (String.concat ";" (StringSet.elements old_paths));
-        List.iter (fun p -> xs.better_unwatch (list_path p) token) (StringSet.elements old_paths);
-        (* Paths which were read do need to be watched: *)
-        let new_paths = StringSet.diff (PathRecorder.accessed path_recorder) current_paths in
-        List.iter (fun p -> xs.better_watch (list_path p) token watch_fn) (StringSet.elements new_paths);
+        with_lock path_recorder.PathRecorder.m "adjust_paths outer" (fun () ->
+          let current_paths,accessed = with_lock lock "adjust_paths" (fun () -> PathRecorder.watched (Some path_recorder), PathRecorder.accessed (Some path_recorder)) () in
+          (* Printf.printf "%s current_paths: [%s]  " path_recorder.PathRecorder.token (String.concat ";" (StringSet.elements current_paths)); *)
+          (* Paths which weren't read don't need to be watched: *)
+          (* Printf.printf "accessed: [%s]  " (String.concat ";" (StringSet.elements accessed)); *)
+          let old_paths = StringSet.diff current_paths accessed in
+          (* Printf.printf "old_paths: [%s]\n%!" (String.concat ";" (StringSet.elements old_paths)); *)
+          xs.better_unwatch (List.map (fun p -> ((list_path p),(path_recorder.PathRecorder.token))) (StringSet.elements old_paths));
+          (* Paths which were read do need to be watched: *)
+          let new_paths = StringSet.diff accessed current_paths in
+          xs.better_watch (List.map (fun p -> ((list_path p),(path_recorder.PathRecorder.token),watch_fn)) (StringSet.elements new_paths))) ();
       in
-      watch_fn [] token;
+      watch_fn [] (path_recorder.PathRecorder.token);
       t
     end
 end
