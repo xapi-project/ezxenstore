@@ -9,12 +9,14 @@ build: [[ "dune" "build" "-p" name "-j" jobs ]]
 depends: [
   "ocaml"
   "dune" {build & >= "1.4"}
+  "astring"
   "cmdliner"
   "logs"
   "uuidm"
   "xenctrl"
   "xenstore"
   "xenstore_transport"
+  "alcotest" {with-test}
 ]
 synopsis:
   "An easy-to-use interface to xenstore"
