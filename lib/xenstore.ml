@@ -100,7 +100,7 @@ module Cache = Xscache.Cache(WatchQueue)
 
 
 let cache = ref Cache.empty
-let caching_enabled = ref false
+let caching_enabled = ref true
 let client = ref None
 let special_cb = ref (fun (_path, _token) -> ())
 let cache_n = ref 0L
