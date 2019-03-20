@@ -60,13 +60,13 @@ let with_lock m n f x =
 let watches = Queue.create ()
 let wcond = Condition.create ()
 
-module WatchQueue = struct  
+module WatchQueue = struct
   let enqueue_watch cb =
     (* Nb, this will be called with the mutex already locked *)
     (* Printf.printf "enqueuing fired watch callback\n%!"; *)
     Queue.add cb watches;
     Condition.broadcast wcond
-  
+
   let start_dequeue_watches_thread () =
     Thread.create (fun () ->
       let rec inner () =
@@ -126,7 +126,7 @@ let process_watch c (path, token) =
     let n = String.sub token cache_sync_stem_len (String.length token - cache_sync_stem_len) |> Int64.of_string in
     (* Printf.printf "%d process_watch: got cache trigger %s\n%!" (Thread.id (Thread.self ())) token; *)
     with_lock lock "cache trigger" (fun () ->
-      cache_sync_seen := n; 
+      cache_sync_seen := n;
       try
         let condition = Hashtbl.find cache_conditions token in
         (* Printf.printf "%d broadcasting %s\n%!" (Thread.id (Thread.self ())) token; *)
@@ -199,7 +199,7 @@ module PathRecorder = struct
     mutable accessed_paths: StringSet.t;        (* paths read or written to *)
     mutable watched_paths: StringSet.t;         (* paths being watched *)
   }
-  let on t_opt f = match t_opt with | Some t -> f t | None -> () 
+  let on t_opt f = match t_opt with | Some t -> f t | None -> ()
   let access t_opt p = on t_opt (fun t -> t.accessed_paths <- StringSet.add p t.accessed_paths)
   let watch t_opt p = on t_opt (fun t -> t.watched_paths <- StringSet.add p t.watched_paths)
   let unwatch t_opt p = on t_opt (fun t -> t.watched_paths <- StringSet.remove p t.watched_paths)
@@ -240,7 +240,7 @@ module Xs = struct
   }
 
   let sync h =
-    let path = "/cache" in 
+    let path = "/cache" in
     let cond = Condition.create () in
     let n,token = with_lock lock "sync find n"
       (fun () ->
@@ -262,7 +262,7 @@ module Xs = struct
       ) ();
     (* Printf.printf "%d sync: cache=%Ld\n%!" (Thread.id (Thread.self ())) n; *)
     Client.unwatch h path token
-    
+
 
   let gen_ops path_recorder immediate h =
     let path p =
@@ -273,7 +273,7 @@ module Xs = struct
       read =
         (fun p ->
           let t,p' = with_lock lock "read" (fun () -> !cache, path p) () in
-          match Cache.read t p' with 
+          match Cache.read t p' with
           | Some x -> x
           | None -> raise (Xs_protocol.Enoent p));
       directory =
@@ -288,7 +288,7 @@ module Xs = struct
           Client.write h p v;
           if immediate then begin
             sync h;
-            with_lock lock "verify_cache" (fun () -> 
+            with_lock lock "verify_cache" (fun () ->
               match Cache.read !cache p' with
               | Some x -> if x <> v then failwith "Argh"
               | None -> failwith (Printf.sprintf "Argh2 %s %s" p v)) ()
@@ -297,11 +297,11 @@ module Xs = struct
       writev =
         (fun base_path kvs ->
           List.iter (fun (k, v) ->
-            let p = base_path ^ "/" ^ k in 
+            let p = base_path ^ "/" ^ k in
             let _p' = with_lock lock "writev" (fun () -> path p) () in
             Client.write h p v) kvs;
             if immediate then sync h);
-      mkdir = 
+      mkdir =
         (fun p ->
           let _p' = with_lock lock "mkdir" (fun () -> path p) in
           Client.mkdir h p);
@@ -314,7 +314,7 @@ module Xs = struct
       getdomainpath = Client.getdomainpath h;
       watch = (fun _p _tok -> ignore(failwith "Unsupported: use better watches!"));
       unwatch = (fun _p _tok -> ignore(failwith "Unsupported: use better watches!"));
-      better_watch = (fun watches -> 
+      better_watch = (fun watches ->
         with_lock lock "better watch" (fun () ->
           let single (path,tok,cb) =
             (* Printf.printf "watching [/%s] tok=%s\n%!" (String.concat "/" path) tok; *)
@@ -386,7 +386,7 @@ module Xs = struct
       let rec watch_fn path tok =
         (* Printf.printf "%d evaluating watch_fn: path=/%s tok=%s\n%!" (Thread.id (Thread.self ())) (String.concat "/" path) tok; *)
         try
-          with_lock path_recorder.PathRecorder.m "watch_fn outer" (fun () -> 
+          with_lock path_recorder.PathRecorder.m "watch_fn outer" (fun () ->
             with_lock lock "watch_fn" (fun () -> PathRecorder.clear_access (Some path_recorder)) ();
             let result = f xs in
             Xs_client_unix.Task.wakeup t result) ();
