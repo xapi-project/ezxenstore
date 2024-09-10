@@ -1,13 +1,3 @@
-A slightly easier interface to Xenstore than that provided by the ocaml-xenstore and
-ocaml-xenstore-clients libraries. This library is good if you want a single persistent
-connection to xenstored for your process.
+This repo has been merged into `xen-api/ocaml/libs` and is now deprecated.
+However, branches of this repo may still be used for LCM purposes.
 
-Example
--------
-
-```ocaml
-# #require "ezxenstore";;
-# #require "ezxenstore";;
-# Xs_transport.xenstored_socket := "/home/jludlam/devel/ocaml-xenstore-server/mysocket";;
-# with_xs (fun xs -> xs.write "/bar" "baz");;
-```
